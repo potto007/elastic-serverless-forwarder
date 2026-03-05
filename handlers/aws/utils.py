@@ -275,6 +275,8 @@ def get_shipper_from_input(event_input: Input) -> CompositeShipper:
             composite_shipper.set_event_id_generator(event_id_generator=s3_object_id)
         elif event_input.type == "kinesis-data-stream":
             composite_shipper.set_event_id_generator(event_id_generator=kinesis_record_id)
+        elif event_input.type == "kinesis-cloudwatch-logs":
+            composite_shipper.set_event_id_generator(event_id_generator=cloudwatch_logs_object_id)
 
     composite_shipper.add_include_exclude_filter(event_input.include_exclude_filter)
 
@@ -380,6 +382,11 @@ def get_continuing_original_input_type(sqs_record: dict[str, Any]) -> Optional[s
         original_event_source.startswith("arn:aws:kinesis")
         or original_event_source.startswith("arn:aws-us-gov:kinesis")
     ) and original_event_source.find(":stream/") > -1:
+        # Check if this is a kinesis-cloudwatch-logs continuation
+        if "originalInputType" in sqs_record["messageAttributes"]:
+            original_input_type = sqs_record["messageAttributes"]["originalInputType"]["stringValue"]
+            if original_input_type == "kinesis-cloudwatch-logs":
+                return "cloudwatch-logs"
         return "kinesis-data-stream"
 
     return None

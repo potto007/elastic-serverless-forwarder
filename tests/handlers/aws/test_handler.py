@@ -4,6 +4,7 @@
 
 import base64
 import datetime
+import gzip
 import importlib
 import os
 import sys
@@ -300,6 +301,16 @@ _s3_client_mock.config_content = (
     b"      - type: logstash\n"
     b"        args:\n"
     b"          logstash_url: logstash_url\n"
+    b"  - type: kinesis-cloudwatch-logs\n"
+    b"    id: arn:aws:kinesis:eu-central-1:123456789:stream/cw-logs-stream\n"
+    b"    outputs:\n"
+    b"      - type: elasticsearch\n"
+    b"        args:\n"
+    b"          cloud_id: cloud_id:bG9jYWxob3N0OjkyMDAkMA==\n"
+    b"          api_key: api_key\n"
+    b"      - type: logstash\n"
+    b"        args:\n"
+    b"          logstash_url: logstash_url\n"
     b"  - type: dummy\n"
     b"    id: arn:aws:dummy:eu-central-1:123456789:input\n"
     b"    outputs:\n"
@@ -334,6 +345,8 @@ def _download_fileobj(Bucket: str, Key: str, Fileobj: BytesIO) -> None:
     if Key == "please raise":
         raise Exception("raised")
 
+
+_s3_client_mock_default_config_content = _s3_client_mock.config_content
 
 _s3_client_mock.head_object = _head_object
 _s3_client_mock.download_fileobj = _download_fileobj
@@ -385,7 +398,7 @@ def revert_handlers_aws_handler() -> None:
 class TestLambdaHandlerNoop(TestCase):
     @mock.patch("share.config._available_output_types", new=["elasticsearch", "logstash", "output_type"])
     @mock.patch(
-        "share.config._available_input_types", new=["cloudwatch-logs", "s3-sqs", "sqs", "kinesis-data-stream", "dummy"]
+        "share.config._available_input_types", new=["cloudwatch-logs", "s3-sqs", "sqs", "kinesis-data-stream", "kinesis-cloudwatch-logs", "dummy"]
     )
     @mock.patch("storage.S3Storage._s3_client", _s3_client_mock)
     @mock.patch("handlers.aws.utils.apm_capture_serverless", _apm_capture_serverless)
@@ -517,7 +530,7 @@ class TestLambdaHandlerFailure(TestCase):
 
     @mock.patch("share.config._available_output_types", new=["elasticsearch", "logstash", "output_type"])
     @mock.patch(
-        "share.config._available_input_types", new=["cloudwatch-logs", "s3-sqs", "sqs", "kinesis-data-stream", "dummy"]
+        "share.config._available_input_types", new=["cloudwatch-logs", "s3-sqs", "sqs", "kinesis-data-stream", "kinesis-cloudwatch-logs", "dummy"]
     )
     @mock.patch("share.secretsmanager._get_aws_sm_client", new=MockContent._get_aws_sm_client)
     @mock.patch("handlers.aws.utils.get_ec2_client", lambda: _ec2_client_mock)
@@ -1128,3 +1141,71 @@ class TestLambdaHandlerFailure(TestCase):
                 event = deepcopy(dummy_event)
 
                 handler(event, ctx)  # type:ignore
+
+
+def _make_cw_logs_kinesis_data(log_group: str, log_stream: str, log_events: list[dict[str, Any]]) -> str:
+    payload = json_dumper(
+        {
+            "messageType": "DATA_MESSAGE",
+            "owner": "123456789",
+            "logGroup": log_group,
+            "logStream": log_stream,
+            "subscriptionFilters": ["filter"],
+            "logEvents": log_events,
+        }
+    )
+    return base64.b64encode(gzip.compress(payload.encode("utf-8"))).decode("utf-8")
+
+
+@pytest.mark.unit
+class TestLambdaHandlerKinesisCloudwatchLogs(TestCase):
+    def setUp(self) -> None:
+        _s3_client_mock.config_content = _s3_client_mock_default_config_content
+        revert_handlers_aws_handler()
+
+    @mock.patch("share.config._available_output_types", new=["elasticsearch", "logstash", "output_type"])
+    @mock.patch(
+        "share.config._available_input_types",
+        new=["cloudwatch-logs", "s3-sqs", "sqs", "kinesis-data-stream", "kinesis-cloudwatch-logs", "dummy"],
+    )
+    @mock.patch("share.secretsmanager._get_aws_sm_client", new=MockContent._get_aws_sm_client)
+    @mock.patch("handlers.aws.utils.get_ec2_client", lambda: _ec2_client_mock)
+    @mock.patch("handlers.aws.handler.get_sqs_client", lambda: _sqs_client_mock)
+    @mock.patch("storage.S3Storage._s3_client", _s3_client_mock)
+    @mock.patch("handlers.aws.utils.apm_capture_serverless", _apm_capture_serverless)
+    @mock.patch(
+        "handlers.aws.utils._available_triggers",
+        new={"aws:s3": "s3-sqs", "aws:sqs": "sqs", "aws:kinesis": "kinesis-data-stream", "dummy": "s3-sqs"},
+    )
+    def test_kinesis_cloudwatch_logs_completed(self) -> None:
+        reload_handlers_aws_handler()
+
+        os.environ["S3_CONFIG_FILE"] = "s3://s3_config_file_bucket/s3_config_file_object_key"
+        os.environ["SQS_REPLAY_URL"] = "https://sqs.eu-central-1.amazonaws.com/123456789012/replay_queue"
+        os.environ["SQS_CONTINUE_URL"] = "https://sqs.eu-central-1.amazonaws.com/123456789012/continue_queue"
+
+        cw_data = _make_cw_logs_kinesis_data(
+            log_group="logGroup",
+            log_stream="logStream",
+            log_events=[
+                {"id": "event1", "timestamp": 1234567890, "message": "test message 1"},
+                {"id": "event2", "timestamp": 1234567891, "message": "test message 2"},
+            ],
+        )
+
+        lambda_event: dict[str, Any] = {
+            "Records": [
+                {
+                    "kinesis": {
+                        "data": cw_data,
+                        "partitionKey": "partitionKey",
+                        "sequenceNumber": "sequenceNumber",
+                    },
+                    "eventSource": "aws:kinesis",
+                    "eventSourceARN": "arn:aws:kinesis:eu-central-1:123456789:stream/cw-logs-stream",
+                }
+            ]
+        }
+
+        ctx = ContextMock(remaining_time_in_millis=300000)
+        assert handler(lambda_event, ctx) == "completed"  # type:ignore

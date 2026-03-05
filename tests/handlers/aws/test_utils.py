@@ -15,6 +15,7 @@ import pytest
 
 from handlers.aws.utils import (
     cloudwatch_logs_object_id,
+    get_continuing_original_input_type,
     get_shipper_from_input,
     kinesis_record_id,
     s3_object_id,
@@ -326,6 +327,84 @@ class TestGetShipperFromInput(TestCase):
                             """
             with self.assertRaisesRegex(ValueError, "logstash_url"):
                 parse_config(config_yaml_cw)
+
+        with self.subTest("Kinesis-cloudwatch-logs uses cloudwatch_logs_object_id"):
+            config_yaml_kcl: str = """
+                                inputs:
+                                  - type: kinesis-cloudwatch-logs
+                                    id: arn:aws:kinesis:eu-central-1:123456789:stream/test-kcl-stream
+                                    outputs:
+                                        - type: logstash
+                                          args:
+                                            logstash_url: logstash_url
+                            """
+            config = parse_config(config_yaml_kcl)
+            event_input = config.get_input_by_id(
+                "arn:aws:kinesis:eu-central-1:123456789:stream/test-kcl-stream"
+            )
+            assert event_input is not None
+            shipper = get_shipper_from_input(event_input=event_input)
+            assert len(shipper._shippers) == 1
+            assert isinstance(shipper._shippers[0], LogstashShipper)
+            assert shipper._shippers[0]._event_id_generator == cloudwatch_logs_object_id
+            event_input.delete_output_by_destination("logstash_url")
+
+
+@pytest.mark.unit
+class TestGetContinuingOriginalInputType(TestCase):
+    def test_returns_none_when_no_message_attributes(self) -> None:
+        sqs_record: dict[str, Any] = {"body": "test"}
+        assert get_continuing_original_input_type(sqs_record) is None
+
+    def test_returns_none_when_no_original_event_source_arn(self) -> None:
+        sqs_record: dict[str, Any] = {"messageAttributes": {}}
+        assert get_continuing_original_input_type(sqs_record) is None
+
+    def test_returns_cloudwatch_logs_for_logs_arn(self) -> None:
+        sqs_record: dict[str, Any] = {
+            "messageAttributes": {
+                "originalEventSourceARN": {
+                    "stringValue": "arn:aws:logs:us-east-1:123456789:log-group:/test"
+                }
+            }
+        }
+        assert get_continuing_original_input_type(sqs_record) == "cloudwatch-logs"
+
+    def test_returns_kinesis_data_stream_for_kinesis_arn(self) -> None:
+        sqs_record: dict[str, Any] = {
+            "messageAttributes": {
+                "originalEventSourceARN": {
+                    "stringValue": "arn:aws:kinesis:us-east-1:123456789:stream/test"
+                }
+            }
+        }
+        assert get_continuing_original_input_type(sqs_record) == "kinesis-data-stream"
+
+    def test_returns_cloudwatch_logs_when_original_input_type_is_kinesis_cloudwatch_logs(self) -> None:
+        sqs_record: dict[str, Any] = {
+            "messageAttributes": {
+                "originalEventSourceARN": {
+                    "stringValue": "arn:aws:kinesis:us-east-1:123456789:stream/cw-logs-stream"
+                },
+                "originalInputType": {
+                    "stringValue": "kinesis-cloudwatch-logs"
+                },
+            }
+        }
+        assert get_continuing_original_input_type(sqs_record) == "cloudwatch-logs"
+
+    def test_returns_none_for_unknown_input_type(self) -> None:
+        sqs_record: dict[str, Any] = {
+            "messageAttributes": {
+                "originalEventSourceARN": {
+                    "stringValue": "some-unknown-arn"
+                },
+                "originalInputType": {
+                    "stringValue": "some-other-type"
+                },
+            }
+        }
+        assert get_continuing_original_input_type(sqs_record) is None
 
 
 @pytest.mark.unit

@@ -511,10 +511,19 @@ class TestInput(TestCase):
             assert input_cloudwatch_logs.id == "id"
             assert input_cloudwatch_logs.tags == []
 
+        with self.subTest("valid kinesis-cloudwatch-logs init"):
+            input_kinesis_cloudwatch_logs = Input(
+                input_type="kinesis-cloudwatch-logs",
+                input_id="arn:aws:kinesis:us-east-1:123456789:stream/test",
+            )
+            assert input_kinesis_cloudwatch_logs.type == "kinesis-cloudwatch-logs"
+            assert input_kinesis_cloudwatch_logs.id == "arn:aws:kinesis:us-east-1:123456789:stream/test"
+            assert input_kinesis_cloudwatch_logs.tags == []
+
         with self.subTest("not valid type"):
             with self.assertRaisesRegex(
                 ValueError,
-                "^`type` must be one of cloudwatch-logs,s3-sqs,sqs,kinesis-data-stream: another-type given$",
+                "^`type` must be one of cloudwatch-logs,s3-sqs,sqs,kinesis-data-stream,kinesis-cloudwatch-logs: another-type given$",
             ):
                 Input(input_type="another-type", input_id="id")
 
@@ -813,7 +822,7 @@ class TestParseConfig(TestCase):
             with self.assertRaisesRegex(
                 ValueError,
                 "^An error occurred while applying type configuration for input id: "
-                "`type` must be one of cloudwatch-logs,s3-sqs,sqs,kinesis-data-stream: another-type given$",
+                "`type` must be one of cloudwatch-logs,s3-sqs,sqs,kinesis-data-stream,kinesis-cloudwatch-logs: another-type given$",
             ):
                 parse_config(
                     config_yaml="""

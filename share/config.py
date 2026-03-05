@@ -11,7 +11,7 @@ from .include_exlude import IncludeExcludeFilter, IncludeExcludeRule
 from .logger import logger as shared_logger
 from .multiline import ProtocolMultiline
 
-_available_input_types: list[str] = ["cloudwatch-logs", "s3-sqs", "sqs", "kinesis-data-stream"]
+_available_input_types: list[str] = ["cloudwatch-logs", "s3-sqs", "sqs", "kinesis-data-stream", "kinesis-cloudwatch-logs"]
 _available_output_types: list[str] = ["elasticsearch", "logstash"]
 
 
