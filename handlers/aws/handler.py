@@ -15,6 +15,11 @@ from .cloudwatch_logs_trigger import (
     _handle_cloudwatch_logs_event,
     _handle_cloudwatch_logs_move,
 )
+from .kinesis_cloudwatch_logs_trigger import (
+    _handle_kinesis_cloudwatch_logs_invalid_record,
+    _handle_kinesis_cloudwatch_logs_move,
+    _handle_kinesis_cloudwatch_logs_record,
+)
 from .kinesis_trigger import _handle_kinesis_move, _handle_kinesis_record
 from .replay_trigger import ReplayedEventReplayHandler, get_shipper_for_replay_event
 from .s3_sqs_trigger import _handle_s3_sqs_event, _handle_s3_sqs_move
@@ -78,6 +83,12 @@ def lambda_handler(lambda_event: dict[str, Any], lambda_context: context_.Contex
     assert config is not None
 
     sqs_client = get_sqs_client()
+
+    if trigger_type == "kinesis-data-stream":
+        input_id = lambda_event["Records"][0]["eventSourceARN"]
+        event_input = config.get_input_by_id(input_id)
+        if event_input is not None and event_input.type == "kinesis-cloudwatch-logs":
+            trigger_type = "kinesis-cloudwatch-logs"
 
     if trigger_type == "replay-sqs":
         shared_logger.info("trigger", extra={"size": len(lambda_event["Records"])})
@@ -253,7 +264,7 @@ def lambda_handler(lambda_event: dict[str, Any], lambda_context: context_.Contex
             },
         )
 
-    if trigger_type == "kinesis-data-stream":
+    if trigger_type in ("kinesis-data-stream", "kinesis-cloudwatch-logs"):
         shared_logger.info("trigger", extra={"size": len(lambda_event["Records"])})
 
         input_id = lambda_event["Records"][0]["eventSourceARN"]
@@ -284,6 +295,90 @@ def lambda_handler(lambda_event: dict[str, Any], lambda_context: context_.Contex
             )
             return "completed"
 
+    if trigger_type == "kinesis-cloudwatch-logs":
+        composite_shipper = get_shipper_from_input(event_input=event_input)
+
+        event_list_from_field_expander = ExpandEventListFromField(
+            event_input.expand_event_list_from_field,
+            INTEGRATION_SCOPE_GENERIC,
+            expand_event_list_from_field_resolver,
+            event_input.root_fields_to_add_to_expanded_event,
+        )
+
+        for (
+            es_event,
+            last_ending_offset,
+            last_event_expanded_offset,
+            current_kinesis_record_n,
+            current_log_event_n,
+            invalid_kinesis_record,
+        ) in _handle_kinesis_cloudwatch_logs_record(
+            lambda_event,
+            event_input.id,
+            event_list_from_field_expander,
+            event_input.json_content_type,
+            event_input.get_multiline_processor(),
+        ):
+            if es_event is None:
+                assert invalid_kinesis_record is not None
+                _handle_kinesis_cloudwatch_logs_invalid_record(
+                    sqs_client=sqs_client,
+                    sqs_destination_queue=sqs_replaying_queue,
+                    kinesis_record=invalid_kinesis_record,
+                    event_input_id=input_id,
+                    config_yaml=config_yaml,
+                )
+                error_events += 1
+                continue
+
+            sent_outcome = composite_shipper.send(es_event)
+            if sent_outcome == EVENT_IS_SENT:
+                sent_events += 1
+            elif sent_outcome == EVENT_IS_FILTERED:
+                skipped_events += 1
+            else:
+                empty_events += 1
+
+            if lambda_context is not None and lambda_context.get_remaining_time_in_millis() < _completion_grace_period:
+                shared_logger.info(
+                    "lambda is going to shutdown, continuing on dedicated sqs queue",
+                    extra={
+                        "sqs_queue": sqs_continuing_queue,
+                        "sent_events": sent_events,
+                        "empty_events": empty_events,
+                        "skipped_events": skipped_events,
+                        "error_events": error_events,
+                    },
+                )
+
+                composite_shipper.flush()
+
+                _handle_kinesis_cloudwatch_logs_move(
+                    sqs_client=sqs_client,
+                    sqs_destination_queue=sqs_continuing_queue,
+                    kinesis_records=lambda_event["Records"],
+                    current_kinesis_record=current_kinesis_record_n,
+                    input_id=input_id,
+                    config_yaml=config_yaml,
+                    current_log_event=current_log_event_n,
+                    last_ending_offset=last_ending_offset,
+                    last_event_expanded_offset=last_event_expanded_offset,
+                )
+
+                return "continuing"
+
+        composite_shipper.flush()
+        shared_logger.info(
+            "lambda processed all the events",
+            extra={
+                "sent_events": sent_events,
+                "empty_events": empty_events,
+                "skipped_events": skipped_events,
+                "error_events": error_events,
+            },
+        )
+
+    if trigger_type == "kinesis-data-stream":
         composite_shipper = get_shipper_from_input(event_input=event_input)
 
         event_list_from_field_expander = ExpandEventListFromField(
@@ -490,6 +585,7 @@ def lambda_handler(lambda_event: dict[str, Any], lambda_context: context_.Contex
                 event_input.type == "kinesis-data-stream"
                 or event_input.type == "sqs"
                 or event_input.type == "cloudwatch-logs"
+                or event_input.type == "kinesis-cloudwatch-logs"
             ):
                 event_list_from_field_expander = ExpandEventListFromField(
                     event_input.expand_event_list_from_field,
