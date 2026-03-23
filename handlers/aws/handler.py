@@ -19,6 +19,7 @@ from .kinesis_trigger import _handle_kinesis_move, _handle_kinesis_record
 from .replay_trigger import ReplayedEventReplayHandler, get_shipper_for_replay_event
 from .s3_sqs_trigger import _handle_s3_sqs_event, _handle_s3_sqs_move
 from .sqs_trigger import _handle_sqs_event, handle_sqs_move
+from .cloudwatch_metrics_trigger import _handle_cloudwatch_metrics_event
 from .utils import (
     CONFIG_FROM_PAYLOAD,
     GZIP_ENCODING,
@@ -415,7 +416,7 @@ def lambda_handler(lambda_event: dict[str, Any], lambda_context: context_.Contex
                 if timeout_input is None:
                     continue
 
-                if timeout_input.type == "s3-sqs":
+                if timeout_input.type == "s3-sqs" or timeout_input.type == "cloudwatch-metrics":
                     _handle_s3_sqs_move(
                         sqs_client=sqs_client,
                         sqs_destination_queue=sqs_continuing_queue,
@@ -547,6 +548,40 @@ def lambda_handler(lambda_event: dict[str, Any], lambda_context: context_.Contex
                     event_input.root_fields_to_add_to_expanded_event,
                     event_input.json_content_type,
                     event_input.get_multiline_processor(),
+                ):
+                    timeout, sent_outcome = event_processing(
+                        processing_composing_shipper=composite_shipper, processing_es_event=es_event
+                    )
+
+                    if sent_outcome == EVENT_IS_SENT:
+                        sent_events += 1
+                    elif sent_outcome == EVENT_IS_FILTERED:
+                        skipped_events += 1
+                    else:
+                        empty_events += 1
+
+                    if timeout:
+                        for composite_shipper in composite_shipper_cache.values():
+                            composite_shipper.flush()
+
+                        handle_timeout(
+                            remaining_sqs_records=lambda_event["Records"][current_sqs_record:],
+                            timeout_last_ending_offset=last_ending_offset,
+                            timeout_last_event_expanded_offset=last_event_expanded_offset,
+                            timeout_sent_events=sent_events,
+                            timeout_empty_events=empty_events,
+                            timeout_skipped_events=skipped_events,
+                            timeout_config_yaml=config_yaml,
+                            timeout_current_s3_record=current_s3_record,
+                        )
+
+                        return "continuing"
+
+            elif event_input.type == "cloudwatch-metrics":
+                sqs_record_body = json_parser(sqs_record["body"])
+                for es_event, last_ending_offset, last_event_expanded_offset, current_s3_record in _handle_cloudwatch_metrics_event(
+                    sqs_record_body,
+                    event_input.id,
                 ):
                     timeout, sent_outcome = event_processing(
                         processing_composing_shipper=composite_shipper, processing_es_event=es_event

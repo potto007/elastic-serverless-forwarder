@@ -11,7 +11,7 @@ from .include_exlude import IncludeExcludeFilter, IncludeExcludeRule
 from .logger import logger as shared_logger
 from .multiline import ProtocolMultiline
 
-_available_input_types: list[str] = ["cloudwatch-logs", "s3-sqs", "sqs", "kinesis-data-stream"]
+_available_input_types: list[str] = ["cloudwatch-logs", "cloudwatch-metrics", "s3-sqs", "sqs", "kinesis-data-stream"]
 _available_output_types: list[str] = ["elasticsearch", "logstash"]
 
 
@@ -537,6 +537,14 @@ def parse_config(config_yaml: str, expanders: list[Callable[[str], str]] = []) -
             current_input: Input = Input(input_type=input_config["type"], input_id=input_config["id"])
         except ValueError as e:
             raise ValueError(f'An error occurred while applying type configuration for input {input_config["id"]}: {e}')
+
+        if input_config["type"] == "cloudwatch-metrics":
+            _unsupported_options = ["multiline", "json_content_type", "expand_event_list_from_field", "include", "exclude"]
+            for option in _unsupported_options:
+                if option in input_config:
+                    raise ValueError(
+                        f'`{option}` is not supported for cloudwatch-metrics input {input_config["id"]}'
+                    )
 
         if "tags" in input_config:
             current_input.tags = input_config["tags"]

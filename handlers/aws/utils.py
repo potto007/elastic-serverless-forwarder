@@ -284,6 +284,8 @@ def get_shipper_from_input(event_input: Input) -> CompositeShipper:
             composite_shipper.set_event_id_generator(event_id_generator=s3_object_id)
         elif event_input.type == "kinesis-data-stream":
             composite_shipper.set_event_id_generator(event_id_generator=kinesis_record_id)
+        elif event_input.type == "cloudwatch-metrics":
+            composite_shipper.set_event_id_generator(event_id_generator=cloudwatch_metrics_object_id)
 
     composite_shipper.add_include_exclude_filter(event_input.include_exclude_filter)
 
@@ -620,6 +622,24 @@ def kinesis_record_id(event_payload: dict[str, Any]) -> str:
     hex_src = get_hex_prefix(src)
 
     return "-".join([str(approximate_arrival_timestamp), hex_src, f"{offset:012d}"])
+
+
+def cloudwatch_metrics_object_id(event_payload: dict[str, Any]) -> str:
+    """
+    Generates a unique event id given the payload of a CloudWatch metric event.
+    """
+    offset: int = int(event_payload["fields"]["log"]["offset"])
+    namespace: str = str(event_payload["fields"]["aws"]["cloudwatch"]["namespace"])
+    metric_name: str = str(event_payload["meta"].get("metric_name", ""))
+    event_time: int = int(event_payload["meta"]["event_time"])
+
+    dimensions: dict[str, str] = event_payload["fields"]["aws"].get("dimensions", {})
+    sorted_dims = "-".join(f"{k}={v}" for k, v in sorted(dimensions.items()))
+
+    src: str = "-".join([namespace, metric_name, sorted_dims])
+    hex_src = get_hex_prefix(src)
+
+    return "-".join([str(event_time), hex_src, f"{offset:012d}"])
 
 
 # This is implementation specific to AWS and should not reside on share
