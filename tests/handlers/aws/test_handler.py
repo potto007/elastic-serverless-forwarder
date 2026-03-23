@@ -1209,3 +1209,56 @@ class TestLambdaHandlerKinesisCloudwatchLogs(TestCase):
 
         ctx = ContextMock(remaining_time_in_millis=300000)
         assert handler(lambda_event, ctx) == "completed"  # type:ignore
+
+
+@pytest.mark.unit
+class TestCloudwatchMetricsObjectId(TestCase):
+    def test_generates_deterministic_id(self) -> None:
+        from handlers.aws.utils import cloudwatch_metrics_object_id
+
+        event = {
+            "fields": {
+                "aws": {
+                    "cloudwatch": {"namespace": "AWS/EC2"},
+                    "dimensions": {"InstanceId": "i-1234"},
+                    "ec2": {"metrics": {"CPUUtilization": {"avg": 50.0}}},
+                },
+                "log": {"offset": 42},
+            },
+            "meta": {
+                "event_time": 1705312200000,
+                "metric_name": "CPUUtilization",
+            },
+        }
+        id1 = cloudwatch_metrics_object_id(event)
+        id2 = cloudwatch_metrics_object_id(event)
+        assert id1 == id2
+        assert "1705312200000" in id1
+        assert "000000000042" in id1
+
+    def test_different_dimensions_produce_different_ids(self) -> None:
+        from handlers.aws.utils import cloudwatch_metrics_object_id
+
+        event1 = {
+            "fields": {
+                "aws": {
+                    "cloudwatch": {"namespace": "AWS/EC2"},
+                    "dimensions": {"InstanceId": "i-1234"},
+                    "ec2": {"metrics": {"CPUUtilization": {"avg": 50.0}}},
+                },
+                "log": {"offset": 0},
+            },
+            "meta": {"event_time": 1705312200000, "metric_name": "CPUUtilization"},
+        }
+        event2 = {
+            "fields": {
+                "aws": {
+                    "cloudwatch": {"namespace": "AWS/EC2"},
+                    "dimensions": {"InstanceId": "i-5678"},
+                    "ec2": {"metrics": {"CPUUtilization": {"avg": 50.0}}},
+                },
+                "log": {"offset": 0},
+            },
+            "meta": {"event_time": 1705312200000, "metric_name": "CPUUtilization"},
+        }
+        assert cloudwatch_metrics_object_id(event1) != cloudwatch_metrics_object_id(event2)

@@ -523,7 +523,7 @@ class TestInput(TestCase):
         with self.subTest("not valid type"):
             with self.assertRaisesRegex(
                 ValueError,
-                "^`type` must be one of cloudwatch-logs,s3-sqs,sqs,kinesis-data-stream,kinesis-cloudwatch-logs: another-type given$",
+                "^`type` must be one of cloudwatch-logs,cloudwatch-metrics,s3-sqs,sqs,kinesis-data-stream,kinesis-cloudwatch-logs: another-type given$",
             ):
                 Input(input_type="another-type", input_id="id")
 
@@ -810,7 +810,7 @@ class TestParseConfig(TestCase):
             with self.assertRaisesRegex(
                 ValueError,
                 "^An error occurred while applying type configuration for input id: "
-                "`type` must be one of cloudwatch-logs,s3-sqs,sqs,kinesis-data-stream,kinesis-cloudwatch-logs: another-type given$",
+                "`type` must be one of cloudwatch-logs,cloudwatch-metrics,s3-sqs,sqs,kinesis-data-stream,kinesis-cloudwatch-logs: another-type given$",
             ):
                 parse_config(config_yaml="""
             inputs:
@@ -1892,3 +1892,107 @@ class TestParseConfig(TestCase):
             assert elasticsearch.batch_max_actions == 500
             assert elasticsearch.batch_max_bytes == 10485760
             assert elasticsearch.ssl_assert_fingerprint == "2D:4D:CF:FD:6C:2C:00:7E:C3:78:F6:70:A8:F9:34:09:58:6E:40:FC"
+
+
+@pytest.mark.unit
+class TestCloudwatchMetricsConfig(TestCase):
+    _valid_cloudwatch_metrics_config = """
+        inputs:
+          - type: cloudwatch-metrics
+            id: id
+            outputs:
+              - type: elasticsearch
+                args:
+                  cloud_id: "cloud_id"
+                  api_key: "api_key"
+                  es_datastream_name: "es_datastream_name"
+    """
+
+    def test_cloudwatch_metrics_valid_input(self) -> None:
+        config = parse_config(config_yaml=self._valid_cloudwatch_metrics_config)
+        input_metrics = config.get_input_by_id(input_id="id")
+        assert input_metrics is not None
+        assert input_metrics.type == "cloudwatch-metrics"
+        assert input_metrics.id == "id"
+        assert input_metrics.tags == []
+
+    def test_cloudwatch_metrics_rejects_multiline(self) -> None:
+        with self.assertRaisesRegex(ValueError, "`multiline` is not supported for cloudwatch-metrics"):
+            parse_config(config_yaml="""
+        inputs:
+          - type: cloudwatch-metrics
+            id: id
+            multiline:
+              type: pattern
+              pattern: "^\\\\["
+              negate: true
+              match: after
+            outputs:
+              - type: elasticsearch
+                args:
+                  cloud_id: "cloud_id"
+                  api_key: "api_key"
+                  es_datastream_name: "es_datastream_name"
+            """)
+
+    def test_cloudwatch_metrics_rejects_json_content_type(self) -> None:
+        with self.assertRaisesRegex(ValueError, "`json_content_type` is not supported for cloudwatch-metrics"):
+            parse_config(config_yaml="""
+        inputs:
+          - type: cloudwatch-metrics
+            id: id
+            json_content_type: single
+            outputs:
+              - type: elasticsearch
+                args:
+                  cloud_id: "cloud_id"
+                  api_key: "api_key"
+                  es_datastream_name: "es_datastream_name"
+            """)
+
+    def test_cloudwatch_metrics_rejects_expand_event_list(self) -> None:
+        with self.assertRaisesRegex(ValueError, "`expand_event_list_from_field` is not supported for cloudwatch-metrics"):
+            parse_config(config_yaml="""
+        inputs:
+          - type: cloudwatch-metrics
+            id: id
+            expand_event_list_from_field: aField
+            outputs:
+              - type: elasticsearch
+                args:
+                  cloud_id: "cloud_id"
+                  api_key: "api_key"
+                  es_datastream_name: "es_datastream_name"
+            """)
+
+    def test_cloudwatch_metrics_rejects_include(self) -> None:
+        with self.assertRaisesRegex(ValueError, "`include` is not supported for cloudwatch-metrics"):
+            parse_config(config_yaml="""
+        inputs:
+          - type: cloudwatch-metrics
+            id: id
+            include:
+              - "pattern"
+            outputs:
+              - type: elasticsearch
+                args:
+                  cloud_id: "cloud_id"
+                  api_key: "api_key"
+                  es_datastream_name: "es_datastream_name"
+            """)
+
+    def test_cloudwatch_metrics_rejects_exclude(self) -> None:
+        with self.assertRaisesRegex(ValueError, "`exclude` is not supported for cloudwatch-metrics"):
+            parse_config(config_yaml="""
+        inputs:
+          - type: cloudwatch-metrics
+            id: id
+            exclude:
+              - "pattern"
+            outputs:
+              - type: elasticsearch
+                args:
+                  cloud_id: "cloud_id"
+                  api_key: "api_key"
+                  es_datastream_name: "es_datastream_name"
+            """)

@@ -558,3 +558,112 @@ class TestParseError(TestCase):
             assert error["error"]["type"] == "unknown"
             assert error["error"]["message"] == "Unknown error"
             assert "http" not in error
+
+
+@pytest.mark.unit
+class TestElasticsearchShipperMetricsRouting(TestCase):
+    def _make_shipper(self, **kwargs):
+        with mock.patch.object(ElasticsearchShipper, "_elasticsearch_client"):
+            shipper = ElasticsearchShipper(
+                elasticsearch_url="http://localhost:9200",
+                username="user",
+                password="pass",
+                **kwargs,
+            )
+        return shipper
+
+    def test_per_event_data_stream_sets_index(self) -> None:
+        shipper = self._make_shipper()
+        event = {
+            "@timestamp": "2024-01-15T10:30:00.000Z",
+            "fields": {
+                "message": "test metric",
+                "cloud": {"provider": "aws"},
+            },
+            "meta": {
+                "data_stream": "metrics-aws.ec2_metrics-default",
+                "data_stream_type": "metrics",
+                "data_stream_dataset": "aws.ec2_metrics",
+                "data_stream_namespace": "default",
+            },
+        }
+        shipper.send(event)
+        assert len(shipper._bulk_actions) == 1
+        action = shipper._bulk_actions[0]
+        assert action["_index"] == "metrics-aws.ec2_metrics-default"
+
+    def test_per_event_data_stream_type_is_metrics(self) -> None:
+        shipper = self._make_shipper()
+        event = {
+            "@timestamp": "2024-01-15T10:30:00.000Z",
+            "fields": {
+                "message": "test metric",
+                "cloud": {"provider": "aws"},
+            },
+            "meta": {
+                "data_stream": "metrics-aws.ec2_metrics-default",
+                "data_stream_type": "metrics",
+                "data_stream_dataset": "aws.ec2_metrics",
+                "data_stream_namespace": "default",
+            },
+        }
+        shipper.send(event)
+        action = shipper._bulk_actions[0]
+        assert action["data_stream"]["type"] == "metrics"
+        assert action["data_stream"]["dataset"] == "aws.ec2_metrics"
+        assert action["data_stream"]["namespace"] == "default"
+
+    def test_per_event_pipeline_set(self) -> None:
+        shipper = self._make_shipper()
+        event = {
+            "@timestamp": "2024-01-15T10:30:00.000Z",
+            "fields": {
+                "message": "test metric",
+                "cloud": {"provider": "aws"},
+            },
+            "meta": {
+                "data_stream": "metrics-aws.ec2_metrics-default",
+                "pipeline": "metrics-aws.ec2_metrics",
+                "data_stream_type": "metrics",
+                "data_stream_dataset": "aws.ec2_metrics",
+                "data_stream_namespace": "default",
+            },
+        }
+        shipper.send(event)
+        action = shipper._bulk_actions[0]
+        assert action["pipeline"] == "metrics-aws.ec2_metrics"
+
+    def test_log_events_still_use_discover_dataset(self) -> None:
+        shipper = self._make_shipper()
+        event = {
+            "@timestamp": "2024-01-15T10:30:00.000Z",
+            "fields": {
+                "message": "a log line",
+                "log": {"offset": 0},
+            },
+            "meta": {
+                "integration_scope": "generic",
+            },
+        }
+        shipper.send(event)
+        action = shipper._bulk_actions[0]
+        assert action["_index"] == "logs-generic-default"
+        assert action["data_stream"]["type"] == "logs"
+
+    def test_es_datastream_name_override_takes_precedence(self) -> None:
+        shipper = self._make_shipper(es_datastream_name="custom-index")
+        event = {
+            "@timestamp": "2024-01-15T10:30:00.000Z",
+            "fields": {
+                "message": "test metric",
+            },
+            "meta": {
+                "data_stream": "metrics-aws.ec2_metrics-default",
+                "data_stream_type": "metrics",
+                "data_stream_dataset": "aws.ec2_metrics",
+                "data_stream_namespace": "default",
+            },
+        }
+        shipper.send(event)
+        action = shipper._bulk_actions[0]
+        assert action["_index"] == "custom-index"

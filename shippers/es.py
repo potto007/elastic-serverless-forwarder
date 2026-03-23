@@ -141,21 +141,35 @@ class ElasticsearchShipper:
 
     def _enrich_event(self, event_payload: dict[str, Any]) -> None:
         """
-        This method enrich with default metadata the ES event payload.
-        Currently, hardcoded for logs type
+        Enrich with default metadata the ES event payload.
+        Supports both log events (using cached self._dataset) and metric events
+        (using per-event meta.data_stream_* fields).
         """
         if "fields" not in event_payload:
             return
 
         event_payload["tags"] = ["forwarded"]
 
-        if self._dataset != "":
+        # Per-event data stream fields (metrics path)
+        if "meta" in event_payload and "data_stream_type" in event_payload["meta"]:
+            ds_type = event_payload["meta"]["data_stream_type"]
+            ds_dataset = event_payload["meta"]["data_stream_dataset"]
+            ds_namespace = event_payload["meta"]["data_stream_namespace"]
+
+            event_payload["data_stream"] = {
+                "type": ds_type,
+                "dataset": ds_dataset,
+                "namespace": ds_namespace,
+            }
+            event_payload["event"] = {"dataset": ds_dataset}
+            event_payload["tags"] += [ds_dataset.replace(".", "-")]
+        elif self._dataset != "":
+            # Cached dataset (logs path)
             event_payload["data_stream"] = {
                 "type": "logs",
                 "dataset": self._dataset,
                 "namespace": self._namespace,
             }
-
             event_payload["event"] = {"dataset": self._dataset}
             event_payload["tags"] += [self._dataset.replace(".", "-")]
 
@@ -246,8 +260,17 @@ class ElasticsearchShipper:
     def send(self, event: dict[str, Any]) -> str:
         self._replay_args["es_datastream_name"] = self._es_datastream_name
 
-        if not hasattr(self, "_es_index") or self._es_index == "":
-            self._discover_dataset(event_payload=event)
+        # Per-event data stream routing (for metrics): set _index from meta.data_stream
+        # before consulting the cached _es_index, unless es_datastream_name is explicitly set.
+        if (
+            self._es_datastream_name == ""
+            and "meta" in event
+            and "data_stream" in event["meta"]
+        ):
+            event["_index"] = event["meta"]["data_stream"]
+        else:
+            if not hasattr(self, "_es_index") or self._es_index == "":
+                self._discover_dataset(event_payload=event)
 
         self._enrich_event(event_payload=event)
 
@@ -258,6 +281,10 @@ class ElasticsearchShipper:
 
         if "_id" not in event and self._event_id_generator is not None:
             event["_id"] = self._event_id_generator(event)
+
+        # Per-event pipeline targeting (for metrics)
+        if "meta" in event and "pipeline" in event["meta"]:
+            event["pipeline"] = event["meta"]["pipeline"]
 
         event = normalise_event(event_payload=event)
 
