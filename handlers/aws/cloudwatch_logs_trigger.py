@@ -12,6 +12,53 @@ from storage import ProtocolStorage, StorageFactory
 
 from .utils import GZIP_ENCODING, PAYLOAD_ENCODING_KEY, get_account_id_from_arn, gzip_base64_encoded
 
+_LAMBDA_PLATFORM_START = "platform.start"
+_LAMBDA_PLATFORM_REPORT = "platform.report"
+
+
+def _extract_lambda_platform_context(message: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """
+    Parse a logEvent message for Lambda platform event type and context.
+
+    Returns:
+        ("platform.start", context_dict) for start events
+        ("platform.report", None) for report events
+        (None, None) for function logs or parse failures
+    """
+    try:
+        parsed = json_parser(message)
+    except (ValueError, TypeError):
+        return None, None
+
+    if not isinstance(parsed, dict):
+        return None, None
+
+    event_type = parsed.get("type")
+    if event_type == _LAMBDA_PLATFORM_START:
+        record = parsed.get("record", {})
+        context: dict[str, Any] = {}
+        if "requestId" in record:
+            context["request_id"] = record["requestId"]
+        if "functionArn" in record:
+            context["function_arn"] = record["functionArn"]
+        if "version" in record:
+            context["version"] = record["version"]
+        if "tracing" in record:
+            tracing = record["tracing"]
+            context["tracing"] = {}
+            if "spanId" in tracing:
+                context["tracing"]["span_id"] = tracing["spanId"]
+            if "type" in tracing:
+                context["tracing"]["type"] = tracing["type"]
+            if "value" in tracing:
+                context["tracing"]["value"] = tracing["value"]
+        return _LAMBDA_PLATFORM_START, context if context else None
+
+    if event_type == _LAMBDA_PLATFORM_REPORT:
+        return _LAMBDA_PLATFORM_REPORT, None
+
+    return None, None
+
 
 def _from_awslogs_data_to_event(awslogs_data: str) -> Any:
     """
@@ -121,13 +168,21 @@ def _handle_cloudwatch_logs_event(
     log_group_name = event["logGroup"]
     log_stream_name = event["logStream"]
 
+    lambda_context: Optional[dict[str, Any]] = None
+
     for cloudwatch_log_event_n, cloudwatch_log_event in enumerate(event["logEvents"]):
         event_id = cloudwatch_log_event["id"]
         event_timestamp = cloudwatch_log_event["timestamp"]
+        message = cloudwatch_log_event["message"]
+
+        # Track Lambda platform context across log events
+        platform_type, platform_context = _extract_lambda_platform_context(message)
+        if platform_type == _LAMBDA_PLATFORM_START:
+            lambda_context = platform_context
 
         storage_message: ProtocolStorage = StorageFactory.create(
             storage_type="payload",
-            payload=cloudwatch_log_event["message"],
+            payload=message,
             json_content_type=json_content_type,
             event_list_from_field_expander=event_list_from_field_expander,
             multiline_processor=multiline_processor,
@@ -137,6 +192,21 @@ def _handle_cloudwatch_logs_event(
 
         for log_event, starting_offset, ending_offset, event_expanded_offset in events:
             assert isinstance(log_event, bytes)
+
+            aws_fields: dict[str, Any] = {
+                "cloudwatch": {
+                    "log_group": log_group_name,
+                    "log_stream": log_stream_name,
+                    "event_id": event_id,
+                },
+            }
+
+            # Enrich function logs (non-platform events) with Lambda context
+            if platform_type is None:
+                if lambda_context is not None:
+                    aws_fields["lambda"] = dict(lambda_context)
+                else:
+                    aws_fields["lambda"] = {"_enrichment_error": "no platform.start context available"}
 
             es_event: dict[str, Any] = {
                 "@timestamp": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
@@ -148,13 +218,7 @@ def _handle_cloudwatch_logs_event(
                             "path": f"{log_group_name}/{log_stream_name}",
                         },
                     },
-                    "aws": {
-                        "cloudwatch": {
-                            "log_group": log_group_name,
-                            "log_stream": log_stream_name,
-                            "event_id": event_id,
-                        }
-                    },
+                    "aws": aws_fields,
                     "cloud": {
                         "provider": "aws",
                         "region": aws_region,
@@ -165,3 +229,7 @@ def _handle_cloudwatch_logs_event(
             }
 
             yield es_event, ending_offset, event_expanded_offset, cloudwatch_log_event_n
+
+        # Clear context after platform.report
+        if platform_type == _LAMBDA_PLATFORM_REPORT:
+            lambda_context = None
