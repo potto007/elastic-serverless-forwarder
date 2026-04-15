@@ -2,7 +2,6 @@
 # or more contributor license agreements. Licensed under the Elastic License 2.0;
 # you may not use this file except in compliance with the Elastic License 2.0.
 
-import json
 from typing import Any, Optional
 
 import pytest
@@ -276,8 +275,8 @@ class TestLambdaEnrichment:
             assert "cloud" in r["fields"]
             assert r["fields"]["cloud"]["provider"] == "aws"
 
-    def test_function_log_msg_renamed_to_message(self) -> None:
-        """Function log "msg" key should be renamed to "message" for ingest pipeline."""
+    def test_function_log_msg_in_lambda_fields(self) -> None:
+        """Function log "msg" extracted into fields.aws.lambda.message."""
         log_events = [
             {"id": "1", "timestamp": 1000, "message": _platform_start_message()},
             {"id": "2", "timestamp": 1001, "message": _function_log_message("Using repository Helm client")},
@@ -285,30 +284,26 @@ class TestLambdaEnrichment:
         cw_event = _make_cw_event(log_events)
         results = _collect_results(cw_event)
 
-        fn_log = json.loads(results[1]["fields"]["message"])
-        assert "message" in fn_log
-        assert "msg" not in fn_log
-        assert fn_log["message"] == "Using repository Helm client"
+        lambda_fields = results[1]["fields"]["aws"]["lambda"]
+        assert lambda_fields["message"] == "Using repository Helm client"
+        # fields.message still has full JSON blob
+        assert "msg" in results[1]["fields"]["message"]
 
-    def test_msg_not_renamed_when_message_already_exists(self) -> None:
-        """Don't clobber existing "message" key if both "msg" and "message" present."""
-        msg_with_both = json_dumper({
-            "time": "2026-04-08T19:12:49.738Z",
-            "msg": "short",
-            "message": "full message",
-        })
+    def test_function_log_level_in_log_fields(self) -> None:
+        """Function log "level" extracted into fields.log.level."""
         log_events = [
-            {"id": "1", "timestamp": 1000, "message": msg_with_both},
+            {"id": "1", "timestamp": 1000, "message": _platform_start_message()},
+            {"id": "2", "timestamp": 1001, "message": _function_log_message("test")},
         ]
         cw_event = _make_cw_event(log_events)
         results = _collect_results(cw_event)
 
-        fn_log = json.loads(results[0]["fields"]["message"])
-        assert fn_log["message"] == "full message"
-        assert fn_log["msg"] == "short"
+        assert results[1]["fields"]["log"]["level"] == "INFO"
+        # platform.start should not have level
+        assert "level" not in results[0]["fields"]["log"]
 
-    def test_msg_not_renamed_on_platform_events(self) -> None:
-        """Platform events should not have msg->message rewrite."""
+    def test_function_log_fields_not_on_platform_events(self) -> None:
+        """Platform events should not have msg/level extraction."""
         log_events = [
             {"id": "1", "timestamp": 1000, "message": _platform_start_message()},
             {"id": "2", "timestamp": 1001, "message": _platform_report_message()},
@@ -316,17 +311,20 @@ class TestLambdaEnrichment:
         cw_event = _make_cw_event(log_events)
         results = _collect_results(cw_event)
 
-        # Platform events pass through unchanged - verify no "message" key injected
         for r in results:
-            parsed = json.loads(r["fields"]["message"])
-            assert "msg" not in parsed  # platform events don't have msg key anyway
+            assert "lambda" not in r["fields"]["aws"]
+            assert "level" not in r["fields"]["log"]
 
-    def test_plain_text_not_affected_by_msg_rewrite(self) -> None:
-        """Plain text messages should not be affected by msg rewrite."""
+    def test_plain_text_no_function_log_fields(self) -> None:
+        """Plain text messages get no msg/level extraction."""
         log_events = [
-            {"id": "1", "timestamp": 1000, "message": "plain text with msg in it"},
+            {"id": "1", "timestamp": 1000, "message": _platform_start_message()},
+            {"id": "2", "timestamp": 1001, "message": "plain text log"},
         ]
         cw_event = _make_cw_event(log_events)
         results = _collect_results(cw_event)
 
-        assert results[0]["fields"]["message"] == "plain text with msg in it"
+        lambda_fields = results[1]["fields"]["aws"]["lambda"]
+        assert "message" not in lambda_fields
+        assert lambda_fields["request_id"] == "req-123"
+        assert "level" not in results[1]["fields"]["log"]

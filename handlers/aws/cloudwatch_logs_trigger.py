@@ -7,7 +7,7 @@ from typing import Any, Iterator, Optional
 
 from botocore.client import BaseClient as BotoBaseClient
 
-from share import ExpandEventListFromField, ProtocolMultiline, json_dumper, json_parser, shared_logger
+from share import ExpandEventListFromField, ProtocolMultiline, json_parser, shared_logger
 from storage import ProtocolStorage, StorageFactory
 
 from .utils import GZIP_ENCODING, PAYLOAD_ENCODING_KEY, get_account_id_from_arn, gzip_base64_encoded
@@ -180,13 +180,17 @@ def _handle_cloudwatch_logs_event(
         if platform_type == _LAMBDA_PLATFORM_START:
             lambda_context = platform_context
 
-        # Rename "msg" to "message" in function logs so Lambda ingest pipeline picks it up
+        # Extract function log fields for enrichment
+        function_log_message: Optional[str] = None
+        function_log_level: Optional[str] = None
         if platform_type is None:
             try:
                 parsed_message = json_parser(message)
-                if isinstance(parsed_message, dict) and "msg" in parsed_message and "message" not in parsed_message:
-                    parsed_message["message"] = parsed_message.pop("msg")
-                    message = json_dumper(parsed_message)
+                if isinstance(parsed_message, dict):
+                    if "msg" in parsed_message:
+                        function_log_message = parsed_message["msg"]
+                    if "level" in parsed_message:
+                        function_log_level = parsed_message["level"]
             except (ValueError, TypeError):
                 pass
 
@@ -214,20 +218,27 @@ def _handle_cloudwatch_logs_event(
             # Enrich function logs (non-platform events) with Lambda context
             if platform_type is None:
                 if lambda_context is not None:
-                    aws_fields["lambda"] = dict(lambda_context)
+                    lambda_fields = dict(lambda_context)
                 else:
-                    aws_fields["lambda"] = {"_enrichment_error": "no platform.start context available"}
+                    lambda_fields = {"_enrichment_error": "no platform.start context available"}
+                if function_log_message is not None:
+                    lambda_fields["message"] = function_log_message
+                aws_fields["lambda"] = lambda_fields
+
+            log_fields: dict[str, Any] = {
+                "offset": starting_offset,
+                "file": {
+                    "path": f"{log_group_name}/{log_stream_name}",
+                },
+            }
+            if platform_type is None and function_log_level is not None:
+                log_fields["level"] = function_log_level
 
             es_event: dict[str, Any] = {
                 "@timestamp": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
                 "fields": {
                     "message": log_event.decode("utf-8"),
-                    "log": {
-                        "offset": starting_offset,
-                        "file": {
-                            "path": f"{log_group_name}/{log_stream_name}",
-                        },
-                    },
+                    "log": log_fields,
                     "aws": aws_fields,
                     "cloud": {
                         "provider": "aws",
