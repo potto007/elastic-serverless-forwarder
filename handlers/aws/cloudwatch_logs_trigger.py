@@ -52,35 +52,37 @@ def _wrap_function_log_message(
     Rewrite a Lambda function log message into the platform event structure
     that the Lambda ingest pipeline expects.
 
-    Transforms: {"time":"...","level":"INFO","msg":"hello",...}
-    Into:        {"time":"...","type":"function","record":{"requestId":"...","message":"hello","level":"INFO",...}}
+    Transforms: {"time":"...","level":"INFO","msg":"hello","bucket":"..."}
+    Into:        {"time":"...","type":"platform","level":"INFO",
+                  "record":{"requestId":"...","functionArn":"..."},
+                  "message":{"msg":"hello","bucket":"..."}}
     """
     try:
         parsed = json_parser(message)
     except (ValueError, TypeError):
         parsed = None
 
-    record: dict[str, Any] = {}
+    message_fields: dict[str, Any] = {}
     original_time: Optional[str] = None
-
-    # Merge platform.start context into record
-    if lambda_context is not None:
-        record.update(lambda_context)
+    original_level: Optional[str] = None
 
     if isinstance(parsed, dict):
         original_time = parsed.get("time")
-        # Move all fields except "time" into record, renaming "msg" to "message"
+        original_level = parsed.get("level")
+        # Everything except "time" and "level" goes into message
         for key, value in parsed.items():
-            if key == "time":
+            if key in ("time", "level"):
                 continue
-            elif key == "msg":
-                record["message"] = value
             else:
-                record[key] = value
+                message_fields[key] = value
 
-    wrapped: dict[str, Any] = {"type": "function", "record": record}
+    wrapped: dict[str, Any] = {"type": "platform", "message": message_fields}
+    if lambda_context is not None:
+        wrapped["record"] = dict(lambda_context)
     if original_time is not None:
         wrapped["time"] = original_time
+    if original_level is not None:
+        wrapped["level"] = original_level
 
     return json_dumper(wrapped)
 

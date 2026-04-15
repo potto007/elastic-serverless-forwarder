@@ -159,25 +159,26 @@ class TestWrapFunctionLogMessage:
         context = {"requestId": "req-123", "functionArn": "arn:aws:lambda:..."}
         result = json_parser(_wrap_function_log_message(_function_log_message("hello"), context))
 
-        assert result["type"] == "function"
+        assert result["type"] == "platform"
         assert result["time"] == "2026-04-08T19:12:49.738Z"
+        assert result["level"] == "INFO"
         assert result["record"]["requestId"] == "req-123"
         assert result["record"]["functionArn"] == "arn:aws:lambda:..."
-        assert result["record"]["message"] == "hello"
-        assert result["record"]["level"] == "INFO"
+        assert result["message"]["msg"] == "hello"
+        assert "requestId" not in result["message"]
 
     def test_wraps_without_context(self) -> None:
         from handlers.aws.cloudwatch_logs_trigger import _wrap_function_log_message
 
         result = json_parser(_wrap_function_log_message(_function_log_message("orphan"), None))
 
-        assert result["type"] == "function"
+        assert result["type"] == "platform"
         assert result["time"] == "2026-04-08T19:12:49.738Z"
-        assert result["record"]["message"] == "orphan"
-        assert result["record"]["level"] == "INFO"
-        assert "requestId" not in result["record"]
+        assert result["level"] == "INFO"
+        assert result["message"]["msg"] == "orphan"
+        assert "record" not in result
 
-    def test_preserves_extra_fields(self) -> None:
+    def test_preserves_extra_fields_in_message(self) -> None:
         from handlers.aws.cloudwatch_logs_trigger import _wrap_function_log_message
 
         msg = json_dumper({
@@ -189,27 +190,31 @@ class TestWrapFunctionLogMessage:
         })
         result = json_parser(_wrap_function_log_message(msg, None))
 
-        assert result["record"]["bucket"] == "my-bucket"
-        assert result["record"]["stargate"]["team"]["name"] == "tetris"
-        assert result["record"]["message"] == "test"
-        assert "time" not in result["record"]
+        assert result["message"]["bucket"] == "my-bucket"
+        assert result["message"]["stargate"]["team"]["name"] == "tetris"
+        assert result["message"]["msg"] == "test"
+        assert "time" not in result["message"]
+        assert "level" not in result["message"]
 
     def test_plain_text_message(self) -> None:
         from handlers.aws.cloudwatch_logs_trigger import _wrap_function_log_message
 
         result = json_parser(_wrap_function_log_message("plain text log", None))
 
-        assert result["type"] == "function"
-        assert result["record"] == {}
+        assert result["type"] == "platform"
+        assert result["message"] == {}
         assert "time" not in result
+        assert "level" not in result
 
-    def test_msg_renamed_to_message_in_record(self) -> None:
+    def test_time_and_level_stay_top_level(self) -> None:
         from handlers.aws.cloudwatch_logs_trigger import _wrap_function_log_message
 
         result = json_parser(_wrap_function_log_message(_function_log_message("hello"), None))
 
-        assert "msg" not in result["record"]
-        assert result["record"]["message"] == "hello"
+        assert result["time"] == "2026-04-08T19:12:49.738Z"
+        assert result["level"] == "INFO"
+        assert "time" not in result["message"]
+        assert "level" not in result["message"]
 
 
 class TestLambdaFunctionLogWrapping:
@@ -227,15 +232,15 @@ class TestLambdaFunctionLogWrapping:
 
         assert len(results) == 4
 
-        # function logs wrapped with context
         for r in results[1:3]:
             parsed = _parse_message(r)
-            assert parsed["type"] == "function"
+            assert parsed["type"] == "platform"
             assert parsed["record"]["requestId"] == "req-123"
             assert parsed["record"]["functionArn"] == "arn:aws:lambda:us-east-1:123456789012:function:my-function"
+            assert "requestId" not in parsed["message"]
 
-        assert _parse_message(results[1])["record"]["message"] == "log1"
-        assert _parse_message(results[2])["record"]["message"] == "log2"
+        assert _parse_message(results[1])["message"]["msg"] == "log1"
+        assert _parse_message(results[2])["message"]["msg"] == "log2"
 
     def test_platform_events_not_wrapped(self) -> None:
         log_events = [
@@ -246,7 +251,6 @@ class TestLambdaFunctionLogWrapping:
         results = _collect_results(cw_event)
 
         assert len(results) == 2
-        # platform events pass through as-is
         assert _parse_message(results[0])["type"] == "platform.start"
         assert _parse_message(results[1])["type"] == "platform.report"
 
@@ -260,9 +264,9 @@ class TestLambdaFunctionLogWrapping:
 
         assert len(results) == 2
         parsed = _parse_message(results[0])
-        assert parsed["type"] == "function"
-        assert parsed["record"]["message"] == "orphan"
-        assert "requestId" not in parsed["record"]
+        assert parsed["type"] == "platform"
+        assert parsed["message"]["msg"] == "orphan"
+        assert "record" not in parsed
 
     def test_context_cleared_after_report(self) -> None:
         log_events = [
@@ -276,8 +280,7 @@ class TestLambdaFunctionLogWrapping:
 
         assert len(results) == 4
         assert _parse_message(results[1])["record"]["requestId"] == "req-1"
-        # after report, context cleared
-        assert "requestId" not in _parse_message(results[3])["record"]
+        assert "record" not in _parse_message(results[3])
 
     def test_multiple_invocations_in_payload(self) -> None:
         log_events = [
@@ -306,8 +309,8 @@ class TestLambdaFunctionLogWrapping:
         assert len(results) == 2
         for r in results:
             parsed = _parse_message(r)
-            assert parsed["type"] == "function"
-            assert parsed["record"] == {}
+            assert parsed["type"] == "platform"
+            assert parsed["message"] == {}
 
     def test_existing_cloudwatch_fields_preserved(self) -> None:
         log_events = [
@@ -324,7 +327,7 @@ class TestLambdaFunctionLogWrapping:
             assert r["fields"]["cloud"]["provider"] == "aws"
 
     def test_no_lambda_key_in_aws_fields(self) -> None:
-        """Enrichment is now in fields.message, not fields.aws.lambda."""
+        """Enrichment is in fields.message, not fields.aws.lambda."""
         log_events = [
             {"id": "1", "timestamp": 1000, "message": _platform_start_message()},
             {"id": "2", "timestamp": 1001, "message": _function_log_message("test")},
@@ -347,7 +350,19 @@ class TestLambdaFunctionLogWrapping:
         parsed = _parse_message(results[1])
         assert parsed["time"] == "2026-04-08T19:12:49.738Z"
 
-    def test_function_log_extra_fields_in_record(self) -> None:
+    def test_function_log_level_top_level(self) -> None:
+        log_events = [
+            {"id": "1", "timestamp": 1000, "message": _platform_start_message()},
+            {"id": "2", "timestamp": 1001, "message": _function_log_message("test")},
+        ]
+        cw_event = _make_cw_event(log_events)
+        results = _collect_results(cw_event)
+
+        parsed = _parse_message(results[1])
+        assert parsed["level"] == "INFO"
+        assert "level" not in parsed["message"]
+
+    def test_function_log_extra_fields_in_message(self) -> None:
         msg = json_dumper({
             "time": "2026-04-08T19:12:49.738Z",
             "level": "INFO",
@@ -362,9 +377,9 @@ class TestLambdaFunctionLogWrapping:
         cw_event = _make_cw_event(log_events)
         results = _collect_results(cw_event)
 
-        record = _parse_message(results[1])["record"]
-        assert record["message"] == "Identified K8s artifact"
-        assert record["level"] == "INFO"
-        assert record["bucket"] == "my-bucket"
-        assert record["key"] == "path/to/chart.tgz"
-        assert record["requestId"] == "req-123"
+        parsed = _parse_message(results[1])
+        assert parsed["message"]["msg"] == "Identified K8s artifact"
+        assert parsed["message"]["bucket"] == "my-bucket"
+        assert parsed["message"]["key"] == "path/to/chart.tgz"
+        assert parsed["record"]["requestId"] == "req-123"
+        assert "requestId" not in parsed["message"]
