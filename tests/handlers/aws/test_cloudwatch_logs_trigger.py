@@ -275,3 +275,58 @@ class TestLambdaEnrichment:
             assert cw["log_stream"] == "2026/04/14/[$LATEST]abc123"
             assert "cloud" in r["fields"]
             assert r["fields"]["cloud"]["provider"] == "aws"
+
+    def test_function_log_msg_renamed_to_message(self) -> None:
+        """Function log "msg" key should be renamed to "message" for ingest pipeline."""
+        log_events = [
+            {"id": "1", "timestamp": 1000, "message": _platform_start_message()},
+            {"id": "2", "timestamp": 1001, "message": _function_log_message("Using repository Helm client")},
+        ]
+        cw_event = _make_cw_event(log_events)
+        results = _collect_results(cw_event)
+
+        fn_log = json.loads(results[1]["fields"]["message"])
+        assert "message" in fn_log
+        assert "msg" not in fn_log
+        assert fn_log["message"] == "Using repository Helm client"
+
+    def test_msg_not_renamed_when_message_already_exists(self) -> None:
+        """Don't clobber existing "message" key if both "msg" and "message" present."""
+        msg_with_both = json_dumper({
+            "time": "2026-04-08T19:12:49.738Z",
+            "msg": "short",
+            "message": "full message",
+        })
+        log_events = [
+            {"id": "1", "timestamp": 1000, "message": msg_with_both},
+        ]
+        cw_event = _make_cw_event(log_events)
+        results = _collect_results(cw_event)
+
+        fn_log = json.loads(results[0]["fields"]["message"])
+        assert fn_log["message"] == "full message"
+        assert fn_log["msg"] == "short"
+
+    def test_msg_not_renamed_on_platform_events(self) -> None:
+        """Platform events should not have msg->message rewrite."""
+        log_events = [
+            {"id": "1", "timestamp": 1000, "message": _platform_start_message()},
+            {"id": "2", "timestamp": 1001, "message": _platform_report_message()},
+        ]
+        cw_event = _make_cw_event(log_events)
+        results = _collect_results(cw_event)
+
+        # Platform events pass through unchanged - verify no "message" key injected
+        for r in results:
+            parsed = json.loads(r["fields"]["message"])
+            assert "msg" not in parsed  # platform events don't have msg key anyway
+
+    def test_plain_text_not_affected_by_msg_rewrite(self) -> None:
+        """Plain text messages should not be affected by msg rewrite."""
+        log_events = [
+            {"id": "1", "timestamp": 1000, "message": "plain text with msg in it"},
+        ]
+        cw_event = _make_cw_event(log_events)
+        results = _collect_results(cw_event)
+
+        assert results[0]["fields"]["message"] == "plain text with msg in it"

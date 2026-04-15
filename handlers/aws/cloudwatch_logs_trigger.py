@@ -7,7 +7,7 @@ from typing import Any, Iterator, Optional
 
 from botocore.client import BaseClient as BotoBaseClient
 
-from share import ExpandEventListFromField, ProtocolMultiline, json_parser, shared_logger
+from share import ExpandEventListFromField, ProtocolMultiline, json_dumper, json_parser, shared_logger
 from storage import ProtocolStorage, StorageFactory
 
 from .utils import GZIP_ENCODING, PAYLOAD_ENCODING_KEY, get_account_id_from_arn, gzip_base64_encoded
@@ -179,6 +179,16 @@ def _handle_cloudwatch_logs_event(
         platform_type, platform_context = _extract_lambda_platform_context(message)
         if platform_type == _LAMBDA_PLATFORM_START:
             lambda_context = platform_context
+
+        # Rename "msg" to "message" in function logs so Lambda ingest pipeline picks it up
+        if platform_type is None:
+            try:
+                parsed_message = json_parser(message)
+                if isinstance(parsed_message, dict) and "msg" in parsed_message and "message" not in parsed_message:
+                    parsed_message["message"] = parsed_message.pop("msg")
+                    message = json_dumper(parsed_message)
+            except (ValueError, TypeError):
+                pass
 
         storage_message: ProtocolStorage = StorageFactory.create(
             storage_type="payload",
