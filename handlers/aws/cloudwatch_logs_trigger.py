@@ -7,7 +7,7 @@ from typing import Any, Iterator, Optional
 
 from botocore.client import BaseClient as BotoBaseClient
 
-from share import ExpandEventListFromField, ProtocolMultiline, json_parser, shared_logger
+from share import ExpandEventListFromField, ProtocolMultiline, json_dumper, json_parser, shared_logger
 from storage import ProtocolStorage, StorageFactory
 
 from .utils import GZIP_ENCODING, PAYLOAD_ENCODING_KEY, get_account_id_from_arn, gzip_base64_encoded
@@ -21,7 +21,7 @@ def _extract_lambda_platform_context(message: str) -> tuple[Optional[str], Optio
     Parse a logEvent message for Lambda platform event type and context.
 
     Returns:
-        ("platform.start", context_dict) for start events
+        ("platform.start", record_dict) for start events - keys in original camelCase
         ("platform.report", None) for report events
         (None, None) for function logs or parse failures
     """
@@ -36,28 +36,53 @@ def _extract_lambda_platform_context(message: str) -> tuple[Optional[str], Optio
     event_type = parsed.get("type")
     if event_type == _LAMBDA_PLATFORM_START:
         record = parsed.get("record", {})
-        context: dict[str, Any] = {}
-        if "requestId" in record:
-            context["request_id"] = record["requestId"]
-        if "functionArn" in record:
-            context["function_arn"] = record["functionArn"]
-        if "version" in record:
-            context["version"] = record["version"]
-        if "tracing" in record:
-            tracing = record["tracing"]
-            context["tracing"] = {}
-            if "spanId" in tracing:
-                context["tracing"]["span_id"] = tracing["spanId"]
-            if "type" in tracing:
-                context["tracing"]["type"] = tracing["type"]
-            if "value" in tracing:
-                context["tracing"]["value"] = tracing["value"]
-        return _LAMBDA_PLATFORM_START, context if context else None
+        return _LAMBDA_PLATFORM_START, dict(record) if record else None
 
     if event_type == _LAMBDA_PLATFORM_REPORT:
         return _LAMBDA_PLATFORM_REPORT, None
 
     return None, None
+
+
+def _wrap_function_log_message(
+    message: str,
+    lambda_context: Optional[dict[str, Any]],
+) -> str:
+    """
+    Rewrite a Lambda function log message into the platform event structure
+    that the Lambda ingest pipeline expects.
+
+    Transforms: {"time":"...","level":"INFO","msg":"hello",...}
+    Into:        {"time":"...","type":"function","record":{"requestId":"...","message":"hello","level":"INFO",...}}
+    """
+    try:
+        parsed = json_parser(message)
+    except (ValueError, TypeError):
+        parsed = None
+
+    record: dict[str, Any] = {}
+    original_time: Optional[str] = None
+
+    # Merge platform.start context into record
+    if lambda_context is not None:
+        record.update(lambda_context)
+
+    if isinstance(parsed, dict):
+        original_time = parsed.get("time")
+        # Move all fields except "time" into record, renaming "msg" to "message"
+        for key, value in parsed.items():
+            if key == "time":
+                continue
+            elif key == "msg":
+                record["message"] = value
+            else:
+                record[key] = value
+
+    wrapped: dict[str, Any] = {"type": "function", "record": record}
+    if original_time is not None:
+        wrapped["time"] = original_time
+
+    return json_dumper(wrapped)
 
 
 def _from_awslogs_data_to_event(awslogs_data: str) -> Any:
@@ -180,19 +205,9 @@ def _handle_cloudwatch_logs_event(
         if platform_type == _LAMBDA_PLATFORM_START:
             lambda_context = platform_context
 
-        # Extract function log fields for enrichment
-        function_log_message: Optional[str] = None
-        function_log_level: Optional[str] = None
+        # Wrap function logs in platform event structure for ingest pipeline
         if platform_type is None:
-            try:
-                parsed_message = json_parser(message)
-                if isinstance(parsed_message, dict):
-                    if "msg" in parsed_message:
-                        function_log_message = parsed_message["msg"]
-                    if "level" in parsed_message:
-                        function_log_level = parsed_message["level"]
-            except (ValueError, TypeError):
-                pass
+            message = _wrap_function_log_message(message, lambda_context)
 
         storage_message: ProtocolStorage = StorageFactory.create(
             storage_type="payload",
@@ -207,39 +222,23 @@ def _handle_cloudwatch_logs_event(
         for log_event, starting_offset, ending_offset, event_expanded_offset in events:
             assert isinstance(log_event, bytes)
 
-            aws_fields: dict[str, Any] = {
-                "cloudwatch": {
-                    "log_group": log_group_name,
-                    "log_stream": log_stream_name,
-                    "event_id": event_id,
-                },
-            }
-
-            # Enrich function logs (non-platform events) with Lambda context
-            if platform_type is None:
-                if lambda_context is not None:
-                    lambda_fields = dict(lambda_context)
-                else:
-                    lambda_fields = {"_enrichment_error": "no platform.start context available"}
-                if function_log_message is not None:
-                    lambda_fields["message"] = function_log_message
-                aws_fields["lambda"] = lambda_fields
-
-            log_fields: dict[str, Any] = {
-                "offset": starting_offset,
-                "file": {
-                    "path": f"{log_group_name}/{log_stream_name}",
-                },
-            }
-            if platform_type is None and function_log_level is not None:
-                log_fields["level"] = function_log_level
-
             es_event: dict[str, Any] = {
                 "@timestamp": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
                 "fields": {
                     "message": log_event.decode("utf-8"),
-                    "log": log_fields,
-                    "aws": aws_fields,
+                    "log": {
+                        "offset": starting_offset,
+                        "file": {
+                            "path": f"{log_group_name}/{log_stream_name}",
+                        },
+                    },
+                    "aws": {
+                        "cloudwatch": {
+                            "log_group": log_group_name,
+                            "log_stream": log_stream_name,
+                            "event_id": event_id,
+                        },
+                    },
                     "cloud": {
                         "provider": "aws",
                         "region": aws_region,

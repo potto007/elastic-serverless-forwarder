@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 import pytest
 
-from share import ExpandEventListFromField, json_dumper
+from share import ExpandEventListFromField, json_dumper, json_parser
 
 
 _INPUT_ID = "arn:aws:logs:us-east-1:123456789012:log-group:test-group"
@@ -101,6 +101,11 @@ def _collect_results(
     return results
 
 
+def _parse_message(es_event: dict[str, Any]) -> dict[str, Any]:
+    """Parse fields.message JSON from an es_event."""
+    return json_parser(es_event["fields"]["message"])
+
+
 class TestExtractLambdaPlatformContext:
     """Tests for _extract_lambda_platform_context."""
 
@@ -110,11 +115,10 @@ class TestExtractLambdaPlatformContext:
         event_type, context = _extract_lambda_platform_context(_platform_start_message())
         assert event_type == "platform.start"
         assert context is not None
-        assert context["request_id"] == "req-123"
-        assert context["function_arn"] == "arn:aws:lambda:us-east-1:123456789012:function:my-function"
+        assert context["requestId"] == "req-123"
+        assert context["functionArn"] == "arn:aws:lambda:us-east-1:123456789012:function:my-function"
         assert context["version"] == "$LATEST"
-        assert context["tracing"]["span_id"] == "abc123"
-        assert context["tracing"]["type"] == "X-Amzn-Trace-Id"
+        assert context["tracing"]["spanId"] == "abc123"
 
     def test_platform_report(self) -> None:
         from handlers.aws.cloudwatch_logs_trigger import _extract_lambda_platform_context
@@ -143,13 +147,75 @@ class TestExtractLambdaPlatformContext:
         msg = json_dumper({"type": "platform.start", "record": {}})
         event_type, context = _extract_lambda_platform_context(msg)
         assert event_type == "platform.start"
-        assert context is None  # empty context -> None
+        assert context is None
 
 
-class TestLambdaEnrichment:
-    """Tests for Lambda context enrichment in _handle_cloudwatch_logs_event."""
+class TestWrapFunctionLogMessage:
+    """Tests for _wrap_function_log_message."""
 
-    def test_function_logs_enriched_between_start_and_report(self) -> None:
+    def test_wraps_with_context(self) -> None:
+        from handlers.aws.cloudwatch_logs_trigger import _wrap_function_log_message
+
+        context = {"requestId": "req-123", "functionArn": "arn:aws:lambda:..."}
+        result = json_parser(_wrap_function_log_message(_function_log_message("hello"), context))
+
+        assert result["type"] == "function"
+        assert result["time"] == "2026-04-08T19:12:49.738Z"
+        assert result["record"]["requestId"] == "req-123"
+        assert result["record"]["functionArn"] == "arn:aws:lambda:..."
+        assert result["record"]["message"] == "hello"
+        assert result["record"]["level"] == "INFO"
+
+    def test_wraps_without_context(self) -> None:
+        from handlers.aws.cloudwatch_logs_trigger import _wrap_function_log_message
+
+        result = json_parser(_wrap_function_log_message(_function_log_message("orphan"), None))
+
+        assert result["type"] == "function"
+        assert result["time"] == "2026-04-08T19:12:49.738Z"
+        assert result["record"]["message"] == "orphan"
+        assert result["record"]["level"] == "INFO"
+        assert "requestId" not in result["record"]
+
+    def test_preserves_extra_fields(self) -> None:
+        from handlers.aws.cloudwatch_logs_trigger import _wrap_function_log_message
+
+        msg = json_dumper({
+            "time": "2026-04-08T19:12:49.738Z",
+            "level": "INFO",
+            "msg": "test",
+            "bucket": "my-bucket",
+            "stargate": {"team": {"name": "tetris"}},
+        })
+        result = json_parser(_wrap_function_log_message(msg, None))
+
+        assert result["record"]["bucket"] == "my-bucket"
+        assert result["record"]["stargate"]["team"]["name"] == "tetris"
+        assert result["record"]["message"] == "test"
+        assert "time" not in result["record"]
+
+    def test_plain_text_message(self) -> None:
+        from handlers.aws.cloudwatch_logs_trigger import _wrap_function_log_message
+
+        result = json_parser(_wrap_function_log_message("plain text log", None))
+
+        assert result["type"] == "function"
+        assert result["record"] == {}
+        assert "time" not in result
+
+    def test_msg_renamed_to_message_in_record(self) -> None:
+        from handlers.aws.cloudwatch_logs_trigger import _wrap_function_log_message
+
+        result = json_parser(_wrap_function_log_message(_function_log_message("hello"), None))
+
+        assert "msg" not in result["record"]
+        assert result["record"]["message"] == "hello"
+
+
+class TestLambdaFunctionLogWrapping:
+    """Tests for function log wrapping in _handle_cloudwatch_logs_event."""
+
+    def test_function_logs_wrapped_with_context(self) -> None:
         log_events = [
             {"id": "1", "timestamp": 1000, "message": _platform_start_message()},
             {"id": "2", "timestamp": 1001, "message": _function_log_message("log1")},
@@ -161,39 +227,17 @@ class TestLambdaEnrichment:
 
         assert len(results) == 4
 
-        # platform.start - no lambda enrichment
-        assert "lambda" not in results[0]["fields"]["aws"]
-
-        # function logs - enriched
+        # function logs wrapped with context
         for r in results[1:3]:
-            lambda_fields = r["fields"]["aws"]["lambda"]
-            assert lambda_fields["request_id"] == "req-123"
-            assert lambda_fields["function_arn"] == "arn:aws:lambda:us-east-1:123456789012:function:my-function"
-            assert lambda_fields["version"] == "$LATEST"
-            assert lambda_fields["tracing"]["span_id"] == "abc123"
+            parsed = _parse_message(r)
+            assert parsed["type"] == "function"
+            assert parsed["record"]["requestId"] == "req-123"
+            assert parsed["record"]["functionArn"] == "arn:aws:lambda:us-east-1:123456789012:function:my-function"
 
-        # platform.report - no lambda enrichment
-        assert "lambda" not in results[3]["fields"]["aws"]
+        assert _parse_message(results[1])["record"]["message"] == "log1"
+        assert _parse_message(results[2])["record"]["message"] == "log2"
 
-    def test_orphan_logs_get_error_marker(self) -> None:
-        log_events = [
-            {"id": "1", "timestamp": 1000, "message": _function_log_message("orphan")},
-            {"id": "2", "timestamp": 1001, "message": _platform_start_message()},
-        ]
-        cw_event = _make_cw_event(log_events)
-        results = _collect_results(cw_event)
-
-        assert len(results) == 2
-
-        # orphan - error marker
-        lambda_fields = results[0]["fields"]["aws"]["lambda"]
-        assert "_enrichment_error" in lambda_fields
-        assert "no platform.start context" in lambda_fields["_enrichment_error"]
-
-        # platform.start - no lambda enrichment
-        assert "lambda" not in results[1]["fields"]["aws"]
-
-    def test_platform_events_pass_through_unchanged(self) -> None:
+    def test_platform_events_not_wrapped(self) -> None:
         log_events = [
             {"id": "1", "timestamp": 1000, "message": _platform_start_message()},
             {"id": "2", "timestamp": 1001, "message": _platform_report_message()},
@@ -202,9 +246,23 @@ class TestLambdaEnrichment:
         results = _collect_results(cw_event)
 
         assert len(results) == 2
-        for r in results:
-            assert "lambda" not in r["fields"]["aws"]
-            assert "cloudwatch" in r["fields"]["aws"]
+        # platform events pass through as-is
+        assert _parse_message(results[0])["type"] == "platform.start"
+        assert _parse_message(results[1])["type"] == "platform.report"
+
+    def test_orphan_logs_wrapped_without_context(self) -> None:
+        log_events = [
+            {"id": "1", "timestamp": 1000, "message": _function_log_message("orphan")},
+            {"id": "2", "timestamp": 1001, "message": _platform_start_message()},
+        ]
+        cw_event = _make_cw_event(log_events)
+        results = _collect_results(cw_event)
+
+        assert len(results) == 2
+        parsed = _parse_message(results[0])
+        assert parsed["type"] == "function"
+        assert parsed["record"]["message"] == "orphan"
+        assert "requestId" not in parsed["record"]
 
     def test_context_cleared_after_report(self) -> None:
         log_events = [
@@ -217,12 +275,9 @@ class TestLambdaEnrichment:
         results = _collect_results(cw_event)
 
         assert len(results) == 4
-
-        # function log during invocation - enriched
-        assert results[1]["fields"]["aws"]["lambda"]["request_id"] == "req-1"
-
-        # function log after report - orphan error
-        assert "_enrichment_error" in results[3]["fields"]["aws"]["lambda"]
+        assert _parse_message(results[1])["record"]["requestId"] == "req-1"
+        # after report, context cleared
+        assert "requestId" not in _parse_message(results[3])["record"]
 
     def test_multiple_invocations_in_payload(self) -> None:
         log_events = [
@@ -237,15 +292,10 @@ class TestLambdaEnrichment:
         results = _collect_results(cw_event)
 
         assert len(results) == 6
+        assert _parse_message(results[1])["record"]["requestId"] == "req-1"
+        assert _parse_message(results[4])["record"]["requestId"] == "req-2"
 
-        # first invocation function log
-        assert results[1]["fields"]["aws"]["lambda"]["request_id"] == "req-1"
-
-        # second invocation function log
-        assert results[4]["fields"]["aws"]["lambda"]["request_id"] == "req-2"
-
-    def test_plain_text_logs_no_enrichment_no_error(self) -> None:
-        """Non-JSON messages should pass through without enrichment or error."""
+    def test_plain_text_logs_wrapped(self) -> None:
         log_events = [
             {"id": "1", "timestamp": 1000, "message": "START RequestId: req-123"},
             {"id": "2", "timestamp": 1001, "message": "plain text log"},
@@ -254,11 +304,10 @@ class TestLambdaEnrichment:
         results = _collect_results(cw_event)
 
         assert len(results) == 2
-        # Plain text - _extract returns (None, None), so platform_type is None
-        # but lambda_context is also None -> orphan error marker
         for r in results:
-            assert "lambda" in r["fields"]["aws"]
-            assert "_enrichment_error" in r["fields"]["aws"]["lambda"]
+            parsed = _parse_message(r)
+            assert parsed["type"] == "function"
+            assert parsed["record"] == {}
 
     def test_existing_cloudwatch_fields_preserved(self) -> None:
         log_events = [
@@ -272,25 +321,22 @@ class TestLambdaEnrichment:
             cw = r["fields"]["aws"]["cloudwatch"]
             assert cw["log_group"] == "/aws/lambda/my-function"
             assert cw["log_stream"] == "2026/04/14/[$LATEST]abc123"
-            assert "cloud" in r["fields"]
             assert r["fields"]["cloud"]["provider"] == "aws"
 
-    def test_function_log_msg_in_lambda_fields(self) -> None:
-        """Function log "msg" extracted into fields.aws.lambda.message."""
+    def test_no_lambda_key_in_aws_fields(self) -> None:
+        """Enrichment is now in fields.message, not fields.aws.lambda."""
         log_events = [
             {"id": "1", "timestamp": 1000, "message": _platform_start_message()},
-            {"id": "2", "timestamp": 1001, "message": _function_log_message("Using repository Helm client")},
+            {"id": "2", "timestamp": 1001, "message": _function_log_message("test")},
+            {"id": "3", "timestamp": 1002, "message": _platform_report_message()},
         ]
         cw_event = _make_cw_event(log_events)
         results = _collect_results(cw_event)
 
-        lambda_fields = results[1]["fields"]["aws"]["lambda"]
-        assert lambda_fields["message"] == "Using repository Helm client"
-        # fields.message still has full JSON blob
-        assert "msg" in results[1]["fields"]["message"]
+        for r in results:
+            assert "lambda" not in r["fields"]["aws"]
 
-    def test_function_log_level_in_log_fields(self) -> None:
-        """Function log "level" extracted into fields.log.level."""
+    def test_function_log_preserves_original_time(self) -> None:
         log_events = [
             {"id": "1", "timestamp": 1000, "message": _platform_start_message()},
             {"id": "2", "timestamp": 1001, "message": _function_log_message("test")},
@@ -298,33 +344,27 @@ class TestLambdaEnrichment:
         cw_event = _make_cw_event(log_events)
         results = _collect_results(cw_event)
 
-        assert results[1]["fields"]["log"]["level"] == "INFO"
-        # platform.start should not have level
-        assert "level" not in results[0]["fields"]["log"]
+        parsed = _parse_message(results[1])
+        assert parsed["time"] == "2026-04-08T19:12:49.738Z"
 
-    def test_function_log_fields_not_on_platform_events(self) -> None:
-        """Platform events should not have msg/level extraction."""
+    def test_function_log_extra_fields_in_record(self) -> None:
+        msg = json_dumper({
+            "time": "2026-04-08T19:12:49.738Z",
+            "level": "INFO",
+            "msg": "Identified K8s artifact",
+            "bucket": "my-bucket",
+            "key": "path/to/chart.tgz",
+        })
         log_events = [
             {"id": "1", "timestamp": 1000, "message": _platform_start_message()},
-            {"id": "2", "timestamp": 1001, "message": _platform_report_message()},
+            {"id": "2", "timestamp": 1001, "message": msg},
         ]
         cw_event = _make_cw_event(log_events)
         results = _collect_results(cw_event)
 
-        for r in results:
-            assert "lambda" not in r["fields"]["aws"]
-            assert "level" not in r["fields"]["log"]
-
-    def test_plain_text_no_function_log_fields(self) -> None:
-        """Plain text messages get no msg/level extraction."""
-        log_events = [
-            {"id": "1", "timestamp": 1000, "message": _platform_start_message()},
-            {"id": "2", "timestamp": 1001, "message": "plain text log"},
-        ]
-        cw_event = _make_cw_event(log_events)
-        results = _collect_results(cw_event)
-
-        lambda_fields = results[1]["fields"]["aws"]["lambda"]
-        assert "message" not in lambda_fields
-        assert lambda_fields["request_id"] == "req-123"
-        assert "level" not in results[1]["fields"]["log"]
+        record = _parse_message(results[1])["record"]
+        assert record["message"] == "Identified K8s artifact"
+        assert record["level"] == "INFO"
+        assert record["bucket"] == "my-bucket"
+        assert record["key"] == "path/to/chart.tgz"
+        assert record["requestId"] == "req-123"
