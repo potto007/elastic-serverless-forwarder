@@ -54,31 +54,35 @@ def _wrap_function_log_message(
 
     Transforms: {"time":"...","level":"INFO","msg":"hello","bucket":"..."}
     Into:        {"time":"...","type":"platform","level":"INFO",
-                  "record":{"requestId":"...","functionArn":"..."},
-                  "message":{"msg":"hello","bucket":"..."}}
+                  "record":{"requestId":"...","functionArn":"...",
+                            "message":"hello","bucket":"..."}}
     """
     try:
         parsed = json_parser(message)
     except (ValueError, TypeError):
         parsed = None
 
-    message_fields: dict[str, Any] = {}
+    record: dict[str, Any] = {}
     original_time: Optional[str] = None
     original_level: Optional[str] = None
+
+    # Merge platform.start context into record first
+    if lambda_context is not None:
+        record.update(lambda_context)
 
     if isinstance(parsed, dict):
         original_time = parsed.get("time")
         original_level = parsed.get("level")
-        # Everything except "time" and "level" goes into message
+        # Everything except "time" and "level" goes into record, renaming "msg" to "message"
         for key, value in parsed.items():
             if key in ("time", "level"):
                 continue
+            elif key == "msg":
+                record["message"] = value
             else:
-                message_fields[key] = value
+                record[key] = value
 
-    wrapped: dict[str, Any] = {"type": "platform", "message": message_fields}
-    if lambda_context is not None:
-        wrapped["record"] = dict(lambda_context)
+    wrapped: dict[str, Any] = {"type": "platform", "record": record}
     if original_time is not None:
         wrapped["time"] = original_time
     if original_level is not None:
